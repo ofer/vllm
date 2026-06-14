@@ -15,10 +15,17 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
 from vllm.v1.kv_offload.tiering.base import JobMetadata, JobResult
+from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+from vllm.v1.kv_offload.tiering.obj.config import (
+    MemosStoreConfig,
+    ObjStoreConfig,
+    ObjStoreNixlBackend,
+)
 from vllm.v1.kv_offload.tiering.obj.manager import ObjectStoreSecondaryTierManager
 
 # ---------------------------------------------------------------------------
@@ -51,11 +58,23 @@ _STORE_CONFIG = {
     "access_key": "mock-access",
     "secret_key": "mock-secret",
 }
+_MEMOS_STORE_CONFIG = {
+    "nixl_backend": "doca_memos",
+    "device_name": "mlx5_0",
+    "num_tasks": "16",
+    "n_guid": "0",
+    "ignore_read_not_found": "true",
+    "query_mem_mode": "metadata",
+}
 
 _BLOCK_ELEMENTS = 256
 _DTYPE = torch.float32
 _RUN_PREFIX = f"test/{uuid.uuid4().hex[:8]}"
 _CTX = ReqContext(req_id="test-req")
+_NIXL_AGENT_CONFIG_PATH = (
+    "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent_config"
+)
+_NIXL_AGENT_PATH = "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent"
 
 
 def key(n: int) -> OffloadKey:
@@ -76,6 +95,176 @@ def make_job(
         is_promotion=False,
         req_context=_CTX,
     )
+
+
+# ---------------------------------------------------------------------------
+# Configuration tests
+# ---------------------------------------------------------------------------
+
+
+class TestObjStoreConfig:
+    def test_default_nixl_backend_is_obj(self):
+        config = ObjStoreConfig(**_STORE_CONFIG)
+
+        assert config.nixl_backend is ObjStoreNixlBackend.OBJ
+        assert "nixl_backend" not in config.to_nixl_params()
+
+    def test_explicit_doca_memos_nixl_backend(self):
+        config = ObjStoreConfig(**_STORE_CONFIG, nixl_backend="doca_memos")
+
+        assert config.nixl_backend is ObjStoreNixlBackend.DOCA_MEMOS
+        assert "nixl_backend" not in config.to_nixl_params()
+
+    def test_invalid_nixl_backend_lists_supported_values(self):
+        with pytest.raises(ValueError) as exc_info:
+            ObjStoreConfig(**_STORE_CONFIG, nixl_backend="unsupported")
+
+        message = str(exc_info.value)
+        assert "Unsupported object-store NIXL backend 'unsupported'" in message
+        assert "Supported values: 'obj', 'doca_memos'" in message
+
+    def test_memos_store_config_to_nixl_params_excludes_selector(self):
+        config = MemosStoreConfig(**_MEMOS_STORE_CONFIG)
+
+        assert config.nixl_backend is ObjStoreNixlBackend.DOCA_MEMOS
+        assert config.to_nixl_params() == {
+            "device_name": "mlx5_0",
+            "num_tasks": "16",
+            "n_guid": "0",
+            "ignore_read_not_found": "true",
+            "query_mem_mode": "metadata",
+        }
+
+
+class TestObjStoreManagerConfig:
+    def test_invalid_nixl_backend_fails_before_agent_creation(self):
+        tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        view = memoryview(tensor.numpy())
+        store_config = {**_STORE_CONFIG, "nixl_backend": "unsupported"}
+
+        with (
+            patch(_NIXL_AGENT_CONFIG_PATH) as agent_config,
+            patch(_NIXL_AGENT_PATH) as agent,
+            pytest.raises(
+                ValueError,
+                match="Unsupported object-store NIXL backend 'unsupported'",
+            ),
+        ):
+            ObjectStoreSecondaryTierManager(
+                offloading_spec=_OFFLOADING_SPEC,
+                primary_kv_view=view,
+                tier_type="obj",
+                store_config=store_config,
+            )
+
+        agent_config.assert_not_called()
+        agent.assert_not_called()
+
+    def test_default_backend_initialization_uses_obj(self):
+        tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        view = memoryview(tensor.numpy())
+        mock_agent = MockNixlAgent()
+
+        with (
+            patch(_NIXL_AGENT_CONFIG_PATH),
+            patch(_NIXL_AGENT_PATH, return_value=mock_agent),
+        ):
+            ObjectStoreSecondaryTierManager(
+                offloading_spec=_OFFLOADING_SPEC,
+                primary_kv_view=view,
+                tier_type="obj",
+                store_config=_STORE_CONFIG,
+            )
+
+        assert mock_agent.create_backend_calls == [
+            (
+                "OBJ",
+                {
+                    "bucket": "mock-bucket",
+                    "endpoint_override": "mock:9000",
+                    "scheme": "http",
+                    "access_key": "mock-access",
+                    "secret_key": "mock-secret",
+                    "num_threads": "4",
+                },
+            )
+        ]
+        assert mock_agent.query_memory_calls[-1][1:] == ("OBJ", "OBJ")
+
+    def test_doca_memos_backend_initialization_uses_doca_memos(self):
+        tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        view = memoryview(tensor.numpy())
+        mock_agent = MockNixlAgent()
+
+        with (
+            patch(_NIXL_AGENT_CONFIG_PATH),
+            patch(_NIXL_AGENT_PATH, return_value=mock_agent),
+        ):
+            ObjectStoreSecondaryTierManager(
+                offloading_spec=_OFFLOADING_SPEC,
+                primary_kv_view=view,
+                tier_type="obj",
+                store_config=_MEMOS_STORE_CONFIG,
+            )
+
+        assert mock_agent.create_backend_calls == [
+            (
+                "DOCA_MEMOS",
+                {
+                    "device_name": "mlx5_0",
+                    "num_tasks": "16",
+                    "n_guid": "0",
+                    "ignore_read_not_found": "true",
+                    "query_mem_mode": "metadata",
+                },
+            )
+        ]
+        assert mock_agent.query_memory_calls[-1][1:] == ("DOCA_MEMOS", "OBJ")
+
+    def test_doca_memos_transfers_still_use_obj_memory(self):
+        tier, agent = _make_tier(store_config=_MEMOS_STORE_CONFIG)
+
+        tier.submit_store(make_job(1, [key(1)], [0]))
+
+        assert agent.create_backend_calls[0][0] == "DOCA_MEMOS"
+        assert any(call[1] == "OBJ" for call in agent.register_memory_calls)
+
+    def test_factory_keeps_obj_tier_for_doca_memos_backend(self):
+        tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        view = memoryview(tensor.numpy())
+        mock_agent = MockNixlAgent()
+        tier_config = {
+            "type": "obj",
+            "store_config": _MEMOS_STORE_CONFIG,
+            "prefix": _RUN_PREFIX,
+            "io_threads": 8,
+        }
+
+        with (
+            patch(_NIXL_AGENT_CONFIG_PATH),
+            patch(_NIXL_AGENT_PATH, return_value=mock_agent),
+        ):
+            tier = SecondaryTierFactory.create_secondary_tier(
+                tier_config,
+                view,
+                _OFFLOADING_SPEC,
+            )
+
+        assert isinstance(tier, ObjectStoreSecondaryTierManager)
+        assert tier.tier_type == "obj"
+        assert mock_agent.create_backend_calls == [
+            (
+                "DOCA_MEMOS",
+                {
+                    "device_name": "mlx5_0",
+                    "num_tasks": "16",
+                    "n_guid": "0",
+                    "ignore_read_not_found": "true",
+                    "query_mem_mode": "metadata",
+                },
+            )
+        ]
+        assert mock_agent.query_memory_calls[0][1:] == ("DOCA_MEMOS", "OBJ")
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +294,10 @@ class MockNixlAgent:
         self._pending: dict[int, tuple[str, list[str]]] = {}
         self._handle_counter = 0
         self._last_obj_keys: list[str] = []
+        self._backends: set[str] = set()
+        self.create_backend_calls: list[tuple[str, dict[str, str]]] = []
+        self.register_memory_calls = []
+        self.query_memory_calls = []
         # Bind default implementations as instance attributes.
         self.register_memory = self._register_memory
         self.make_prepped_xfer = self._make_prepped_xfer
@@ -112,9 +305,11 @@ class MockNixlAgent:
         self.query_memory = self._query_memory
 
     def create_backend(self, backend_type, params):
-        pass
+        self._backends.add(backend_type)
+        self.create_backend_calls.append((backend_type, dict(params)))
 
     def _register_memory(self, descs, mem_type=None, backends=None):
+        self.register_memory_calls.append((descs, mem_type, backends))
         mock = MagicMock()
         mock.trim.return_value = MagicMock()
         # Capture obj_keys from OBJ 4-tuples: (addr, len, dev_id, obj_key)
@@ -162,7 +357,10 @@ class MockNixlAgent:
     def release_dlist_handle(self, handle):
         pass
 
-    def _query_memory(self, queries, mem_type, agent_name):
+    def _query_memory(self, queries, backend, mem_type):
+        if backend not in self._backends:
+            raise ValueError(f"Backend {backend!r} not found")
+        self.query_memory_calls.append((queries, backend, mem_type))
         return [object() if q[3] in self._stored_obj_keys else None for q in queries]
 
 
@@ -173,15 +371,18 @@ class MockNixlAgent:
 
 def _make_tier(
     num_blocks: int = 4,
+    store_config: dict | None = None,
 ) -> tuple[ObjectStoreSecondaryTierManager, MockNixlAgent]:
     """Create a tier backed by a fresh MockNixlAgent."""
     mock_agent = MockNixlAgent()
     tensor = torch.zeros((num_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
     view = memoryview(tensor.numpy())
+    if store_config is None:
+        store_config = _STORE_CONFIG
     with (
-        patch("vllm.v1.kv_offload.tiering.obj.manager.nixl_agent_config"),
+        patch(_NIXL_AGENT_CONFIG_PATH),
         patch(
-            "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent",
+            _NIXL_AGENT_PATH,
             return_value=mock_agent,
         ),
     ):
@@ -189,7 +390,7 @@ def _make_tier(
             offloading_spec=_OFFLOADING_SPEC,
             primary_kv_view=view,
             tier_type="obj",
-            store_config=_STORE_CONFIG,
+            store_config=store_config,
             prefix=_RUN_PREFIX,
         )
     return tier, mock_agent

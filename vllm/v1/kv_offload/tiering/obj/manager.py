@@ -18,7 +18,11 @@ from vllm.v1.kv_offload.tiering.base import (
     RequestOffloadingContext,
     SecondaryTierManager,
 )
-from vllm.v1.kv_offload.tiering.obj.config import ObjStoreConfig
+from vllm.v1.kv_offload.tiering.obj.config import (
+    MemosStoreConfig,
+    ObjStoreConfig,
+    ObjStoreNixlBackend,
+)
 
 if TYPE_CHECKING:
     from nixl._api import nixl_prepped_dlist_handle, nixl_xfer_handle
@@ -44,10 +48,48 @@ _PROBE_LEN: int = 1
 _PROBE_DEV_ID: int = 0
 
 
+class NixlBackendInit(NamedTuple):
+    backend_type: str
+    params: dict[str, str]
+
+
 class TransferEntry(NamedTuple):
     xfer_handle: "nixl_xfer_handle"
     files_desc: object
     obj_handle: "nixl_prepped_dlist_handle"
+
+
+def _parse_backend_config(store_config: dict) -> ObjStoreConfig | MemosStoreConfig:
+    """Parse backend-specific object-tier configuration."""
+    nixl_backend = ObjStoreNixlBackend.from_value(
+        store_config.get("nixl_backend", ObjStoreNixlBackend.OBJ)
+    )
+    if nixl_backend is ObjStoreNixlBackend.OBJ:
+        return ObjStoreConfig(**store_config)
+    return MemosStoreConfig(**store_config)
+
+
+def _build_nixl_backend_init(
+    backend_config: ObjStoreConfig | MemosStoreConfig,
+    io_threads: int,
+) -> NixlBackendInit:
+    """Build the NIXL backend type and params for object-tier initialization."""
+    if isinstance(backend_config, ObjStoreConfig):
+        if backend_config.nixl_backend is not ObjStoreNixlBackend.OBJ:
+            raise ValueError(
+                "ObjStoreConfig can only initialize the 'obj' NIXL backend."
+            )
+        params = {**backend_config.to_nixl_params(), "num_threads": str(io_threads)}
+        return NixlBackendInit(backend_type="OBJ", params=params)
+
+    if backend_config.nixl_backend is not ObjStoreNixlBackend.DOCA_MEMOS:
+        raise ValueError(
+            "MemosStoreConfig can only initialize the 'doca_memos' NIXL backend."
+        )
+    return NixlBackendInit(
+        backend_type="DOCA_MEMOS",
+        params=backend_config.to_nixl_params(),
+    )
 
 
 class ObjAsyncLookupManager(AsyncLookupManager):
@@ -77,7 +119,9 @@ class ObjAsyncLookupManager(AsyncLookupManager):
             )
             for k in keys
         ]
-        results = self._tier._agent.query_memory(descriptors, "OBJ", "OBJ")
+        results = self._tier._agent.query_memory(
+            descriptors, self._tier._backend_type, "OBJ"
+        )
         return (r is not None for r in results)
 
 
@@ -98,11 +142,16 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         io_threads: int = 4,
     ):
         super().__init__(offloading_spec, primary_kv_view, tier_type)
+        backend_config = _parse_backend_config(store_config)
+        backend_init = _build_nixl_backend_init(backend_config, io_threads)
+        self._backend_type = backend_init.backend_type
         agent_config = nixl_agent_config(backends=[])
         self._agent = nixl_agent("ObjAgent", agent_config)
-        obj_config = ObjStoreConfig(**store_config)
-        params = {**obj_config.to_nixl_params(), "num_threads": str(io_threads)}
-        self._agent.create_backend("OBJ", params)
+        logger.info(
+            "Object store tier using NIXL backend %s",
+            self._backend_type,
+        )
+        self._agent.create_backend(self._backend_type, backend_init.params)
         self._transfers: dict[int, TransferEntry] = {}
         self._failed_jobs: list[JobResult] = []
         self._primary_reg = None
@@ -149,16 +198,20 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         try:
             self._exists(probe_key)
             logger.info("Object store tier connectivity probe succeeded")
-        except Exception as e:
+        except Exception as exc:
             raise RuntimeError(
-                f"Object store tier connectivity probe failed — check bucket, "
-                f"endpoint_override, access_key, secret_key, and scheme. "
-                f"Error: {e}"
-            ) from e
+                "Object store tier connectivity probe failed for NIXL "
+                f"backend {self._backend_type!r}; check the backend-specific "
+                "store_config. For the default 'obj' backend, check bucket, "
+                "endpoint_override, access_key, secret_key, and scheme. "
+                f"Backend error type: {type(exc).__name__}."
+            ) from None
 
     def _exists(self, obj_key: str) -> bool:
         results = self._agent.query_memory(
-            [(_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)], "OBJ", "OBJ"
+            [(_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)],
+            self._backend_type,
+            "OBJ",
         )
         return results[0] is not None
 
