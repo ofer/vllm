@@ -88,5 +88,6 @@ class MemosStoreConfig:
             "n_guid": self.n_guid,
             "ignore_read_not_found": self.ignore_read_not_found,
             "query_mem_mode": self.query_mem_mode,
+            "convert_key_to_128bit": "true"
         }
         return params
