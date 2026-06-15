@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
+from vllm.v1.kv_offload.cpu.memory import CPUOffloadMemoryBackend
 from vllm.v1.kv_offload.tiering.base import JobMetadata, JobResult
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.obj.config import (
@@ -47,10 +48,17 @@ def _make_vllm_config():
     )
 
 
-_OFFLOADING_SPEC = SimpleNamespace(
-    vllm_config=_make_vllm_config(),
-    kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
-)
+def _make_offloading_spec(
+    cpu_memory_backend: CPUOffloadMemoryBackend = CPUOffloadMemoryBackend.SHM,
+):
+    return SimpleNamespace(
+        vllm_config=_make_vllm_config(),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+        cpu_memory_config=SimpleNamespace(effective_backend=cpu_memory_backend),
+    )
+
+
+_OFFLOADING_SPEC = _make_offloading_spec()
 
 _STORE_CONFIG = {
     "bucket": "mock-bucket",
@@ -66,6 +74,17 @@ _MEMOS_STORE_CONFIG = {
     "ignore_read_not_found": "true",
     "query_mem_mode": "metadata",
 }
+_MEMOS_NIXL_PARAMS = {
+    "device_name": "/dev/ng0n1",
+    "num_tasks": "16",
+    "n_guid": "0",
+    "ignore_read_not_found": "true",
+    "query_mem_mode": "metadata",
+    "convert_key_to_128bit": "true",
+}
+_MEMOS_HUGEPAGE_WARNING = (
+    "DOCA MEMOS requires hugepage-backed CPU KV offload memory"
+)
 
 _BLOCK_ELEMENTS = 256
 _DTYPE = torch.float32
@@ -75,6 +94,7 @@ _NIXL_AGENT_CONFIG_PATH = (
     "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent_config"
 )
 _NIXL_AGENT_PATH = "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent"
+_OBJ_LOGGER_WARNING_PATH = "vllm.v1.kv_offload.tiering.obj.manager.logger.warning"
 
 
 def key(n: int) -> OffloadKey:
@@ -127,13 +147,7 @@ class TestObjStoreConfig:
         config = MemosStoreConfig(**_MEMOS_STORE_CONFIG)
 
         assert config.nixl_backend is ObjStoreNixlBackend.DOCA_MEMOS
-        assert config.to_nixl_params() == {
-            "device_name": "mlx5_0",
-            "num_tasks": "16",
-            "n_guid": "0",
-            "ignore_read_not_found": "true",
-            "query_mem_mode": "metadata",
-        }
+        assert config.to_nixl_params() == _MEMOS_NIXL_PARAMS
 
 
 class TestObjStoreManagerConfig:
@@ -210,16 +224,70 @@ class TestObjStoreManagerConfig:
         assert mock_agent.create_backend_calls == [
             (
                 "DOCA_MEMOS",
-                {
-                    "device_name": "mlx5_0",
-                    "num_tasks": "16",
-                    "n_guid": "0",
-                    "ignore_read_not_found": "true",
-                    "query_mem_mode": "metadata",
-                },
+                _MEMOS_NIXL_PARAMS,
             )
         ]
         assert mock_agent.query_memory_calls[-1][1:] == ("DOCA_MEMOS", "OBJ")
+
+    def test_doca_memos_warns_without_hugepage_cpu_memory(self):
+        tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        view = memoryview(tensor.numpy())
+        mock_agent = MockNixlAgent()
+
+        with (
+            patch(_NIXL_AGENT_CONFIG_PATH),
+            patch(_NIXL_AGENT_PATH, return_value=mock_agent),
+            patch(_OBJ_LOGGER_WARNING_PATH) as warning,
+        ):
+            ObjectStoreSecondaryTierManager(
+                offloading_spec=_make_offloading_spec(CPUOffloadMemoryBackend.SHM),
+                primary_kv_view=view,
+                tier_type="obj",
+                store_config=_MEMOS_STORE_CONFIG,
+            )
+
+        warning.assert_called_once()
+        assert _MEMOS_HUGEPAGE_WARNING in warning.call_args.args[0]
+
+    def test_doca_memos_with_hugepage_cpu_memory_does_not_warn(self):
+        tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        view = memoryview(tensor.numpy())
+        mock_agent = MockNixlAgent()
+
+        with (
+            patch(_NIXL_AGENT_CONFIG_PATH),
+            patch(_NIXL_AGENT_PATH, return_value=mock_agent),
+            patch(_OBJ_LOGGER_WARNING_PATH) as warning,
+        ):
+            ObjectStoreSecondaryTierManager(
+                offloading_spec=_make_offloading_spec(
+                    CPUOffloadMemoryBackend.HUGETLBFS
+                ),
+                primary_kv_view=view,
+                tier_type="obj",
+                store_config=_MEMOS_STORE_CONFIG,
+            )
+
+        warning.assert_not_called()
+
+    def test_obj_backend_without_hugepage_cpu_memory_does_not_warn(self):
+        tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+        view = memoryview(tensor.numpy())
+        mock_agent = MockNixlAgent()
+
+        with (
+            patch(_NIXL_AGENT_CONFIG_PATH),
+            patch(_NIXL_AGENT_PATH, return_value=mock_agent),
+            patch(_OBJ_LOGGER_WARNING_PATH) as warning,
+        ):
+            ObjectStoreSecondaryTierManager(
+                offloading_spec=_make_offloading_spec(CPUOffloadMemoryBackend.SHM),
+                primary_kv_view=view,
+                tier_type="obj",
+                store_config=_STORE_CONFIG,
+            )
+
+        warning.assert_not_called()
 
     def test_doca_memos_transfers_still_use_obj_memory(self):
         tier, agent = _make_tier(store_config=_MEMOS_STORE_CONFIG)
@@ -255,13 +323,7 @@ class TestObjStoreManagerConfig:
         assert mock_agent.create_backend_calls == [
             (
                 "DOCA_MEMOS",
-                {
-                    "device_name": "mlx5_0",
-                    "num_tasks": "16",
-                    "n_guid": "0",
-                    "ignore_read_not_found": "true",
-                    "query_mem_mode": "metadata",
-                },
+                _MEMOS_NIXL_PARAMS,
             )
         ]
         assert mock_agent.query_memory_calls[0][1:] == ("DOCA_MEMOS", "OBJ")

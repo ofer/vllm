@@ -10,6 +10,7 @@ from vllm.distributed.nixl_utils import NixlWrapper as nixl_agent
 from vllm.distributed.nixl_utils import nixl_agent_config
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
+from vllm.v1.kv_offload.cpu.memory import CPUOffloadMemoryBackend
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.base import (
@@ -92,6 +93,27 @@ def _build_nixl_backend_init(
     )
 
 
+def _warn_if_doca_memos_without_hugepages(
+    backend_config: ObjStoreConfig | MemosStoreConfig,
+    offloading_spec: "OffloadingSpec",
+) -> None:
+    if backend_config.nixl_backend is not ObjStoreNixlBackend.DOCA_MEMOS:
+        return
+
+    memory_config = getattr(offloading_spec, "cpu_memory_config", None)
+    current_backend = getattr(memory_config, "effective_backend", None)
+    if current_backend == CPUOffloadMemoryBackend.HUGETLBFS:
+        return
+
+    logger.warning(
+        "DOCA MEMOS requires hugepage-backed CPU KV offload memory. "
+        "Current CPU memory backend is %r; configure "
+        "cpu_memory_backend='hugetlbfs' and set cpu_memory_path to a "
+        "hugetlbfs mount for the offload KV tier.",
+        current_backend,
+    )
+
+
 class ObjAsyncLookupManager(AsyncLookupManager):
     """Async lookup manager for ObjectStoreSecondaryTierManager.
 
@@ -143,6 +165,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
     ):
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         backend_config = _parse_backend_config(store_config)
+        _warn_if_doca_memos_without_hugepages(backend_config, offloading_spec)
         backend_init = _build_nixl_backend_init(backend_config, io_threads)
         self._backend_type = backend_init.backend_type
         agent_config = nixl_agent_config(backends=[])
